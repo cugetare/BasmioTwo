@@ -1,0 +1,13 @@
+# ESP-IDF build output
+/build/
+/managed_components/
+sdkconfig.old
+
+# IDE / tools
+.vscode/
+.codex/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db

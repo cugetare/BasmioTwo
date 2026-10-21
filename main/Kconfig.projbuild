@@ -1,0 +1,62 @@
+menu "Basmio Board Diagnostics"
+
+    config SPOD_C6_DEBUG_BRIDGE
+        bool "Boot into ESP32-C6 UART debug bridge"
+        default n
+        help
+            Starts a raw bridge between the ESP32-P4 USB console and the
+            ESP32-C6 UART0 pins. This is a diagnostic mode; normal UI/audio
+            startup is skipped while it is enabled.
+
+    config SPOD_C6_DEBUG_BRIDGE_UART_PORT
+        int "P4 UART port for C6 bridge"
+        depends on SPOD_C6_DEBUG_BRIDGE
+        range 0 4
+        default 1
+
+    config SPOD_C6_DEBUG_BRIDGE_BAUDRATE
+        int "C6 UART baudrate"
+        depends on SPOD_C6_DEBUG_BRIDGE
+        range 9600 3000000
+        default 115200
+        help
+            ESP32 ROM and bootloader logs normally use 115200 baud.
+
+    config SPOD_C6_DEBUG_BRIDGE_P4_TX_GPIO
+        int "P4 TX GPIO connected to C6_U0RXD"
+        depends on SPOD_C6_DEBUG_BRIDGE
+        range 0 54
+        default 11
+
+    config SPOD_C6_DEBUG_BRIDGE_P4_RX_GPIO
+        int "P4 RX GPIO connected to C6_U0TXD"
+        depends on SPOD_C6_DEBUG_BRIDGE
+        range 0 54
+        default 12
+
+    config SPOD_C6_DEBUG_BRIDGE_C6_BOOT_GPIO
+        int "P4 GPIO connected to C6 GPIO9/BOOT (-1 unused)"
+        depends on SPOD_C6_DEBUG_BRIDGE
+        range -1 54
+        default 13
+
+    config SPOD_C6_DEBUG_BRIDGE_C6_RESET_GPIO
+        int "P4 GPIO connected to C6 reset/CHIP_PU (-1 unused)"
+        depends on SPOD_C6_DEBUG_BRIDGE
+        range -1 54
+        default 54
+
+    config SPOD_C6_DEBUG_BRIDGE_RESET_ON_START
+        bool "Reset C6 when bridge starts"
+        depends on SPOD_C6_DEBUG_BRIDGE
+        default y
+
+    config SPOD_C6_DEBUG_BRIDGE_FORCE_BOOTLOADER
+        bool "Hold C6 GPIO9 low during reset"
+        depends on SPOD_C6_DEBUG_BRIDGE
+        default n
+        help
+            Enable only when you want the C6 ROM download bootloader instead
+            of the currently installed firmware boot log.
+
+endmenu

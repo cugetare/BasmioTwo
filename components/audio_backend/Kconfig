@@ -1,0 +1,84 @@
+menu "Audio Backend Configuration"
+
+    choice AUDIO_BACKEND_SDMMC_BUS_WIDTH
+        prompt "SDMMC bus width"
+        default AUDIO_BACKEND_SDMMC_BUS_WIDTH_4
+        help
+            Select the preferred SDMMC bus width for card initialization.
+            4-bit is faster, 1-bit is more tolerant with marginal wiring.
+
+        config AUDIO_BACKEND_SDMMC_BUS_WIDTH_4
+            bool "4-bit (D0-D3)"
+
+        config AUDIO_BACKEND_SDMMC_BUS_WIDTH_1
+            bool "1-bit (D0 only)"
+    endchoice
+
+    config AUDIO_BACKEND_SDMMC_TRY_1BIT_FALLBACK
+        bool "Fallback to 1-bit when preferred width fails"
+        default y
+        depends on AUDIO_BACKEND_SDMMC_BUS_WIDTH_4
+        help
+            If initial mount fails in 4-bit mode, retry once in 1-bit mode.
+
+    config AUDIO_BACKEND_SDMMC_MAX_FREQ_KHZ
+        int "SDMMC max frequency (kHz)"
+        range 400 40000
+        default 20000
+        help
+            Maximum transfer frequency after card init. Probing still starts
+            at low speed.
+
+    config AUDIO_BACKEND_SDMMC_FORMAT_IF_MOUNT_FAILED
+        bool "Format SD card if mount fails"
+        default n
+        help
+            If enabled, card will be partitioned/formatted as FAT when mount
+            fails. WARNING: this erases card content.
+
+if SOC_SDMMC_IO_POWER_EXTERNAL
+
+    config AUDIO_BACKEND_SDMMC_USE_INTERNAL_LDO
+        bool "Use internal LDO power control for SD IO"
+        default y if IDF_TARGET_ESP32P4
+        default n
+        help
+            Enable this when the board powers SD IO from an internal LDO
+            (common with ESP32-P4 default high-speed SDMMC pins).
+
+    config AUDIO_BACKEND_SDMMC_LDO_CHANNEL_ID
+        int "Internal LDO channel ID"
+        depends on AUDIO_BACKEND_SDMMC_USE_INTERNAL_LDO
+        default 4 if IDF_TARGET_ESP32P4
+        default 4
+
+endif
+
+    config AUDIO_BACKEND_WIFI_STA_SSID
+        string "Wi-Fi STA SSID (upload mode)"
+        default ""
+        help
+            Station SSID used by the built-in upload web server.
+            If empty, Wi-Fi upload mode cannot start.
+
+    config AUDIO_BACKEND_WIFI_STA_PASSWORD
+        string "Wi-Fi STA password (upload mode)"
+        default ""
+        help
+            Station password used by upload mode.
+
+    config AUDIO_BACKEND_WIFI_CONNECT_TIMEOUT_MS
+        int "Wi-Fi connect timeout (ms)"
+        range 1000 60000
+        default 12000
+        help
+            Maximum time to wait for STA connection before failing.
+
+    config AUDIO_BACKEND_WIFI_HTTP_PORT
+        int "Upload web server port"
+        range 1 65535
+        default 80
+        help
+            HTTP server port for story upload UI/API.
+
+endmenu
