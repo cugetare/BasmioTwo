@@ -109,6 +109,12 @@ static uint8_t s_np_cached_volume = 0xFF;
 static spod_sleep_state_t s_np_cached_sleep = SLEEP_STATE_COUNT;
 
 /* --- Chapters bottom sheet --- */
+/*
+ * Was a fixed 480 px from the 800 px tall P4 layout; on the 320 px panel that
+ * slid the header and close button off the top. Cover the full screen instead.
+ */
+#define CH_SHEET_H        DISPLAY_H
+#define CH_SHEET_HEADER_H 68
 static lv_obj_t *s_ch_sheet = NULL;
 static lv_obj_t *s_ch_list  = NULL;
 
@@ -1300,7 +1306,7 @@ void ui_chapters_sheet_set_visible(bool visible, const spod_app_state_t *state)
         lv_anim_init(&a);
         lv_anim_set_var(&a, s_ch_sheet);
         lv_anim_set_exec_cb(&a, sheet_anim_y_cb);
-        lv_anim_set_values(&a, DISPLAY_H, DISPLAY_H - 480);
+        lv_anim_set_values(&a, DISPLAY_H, DISPLAY_H - CH_SHEET_H);
         lv_anim_set_time(&a, 280);
         lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
         lv_anim_start(&a);
@@ -1653,7 +1659,7 @@ void ui_screen_now_playing_create(const spod_app_state_t *state)
      * ui_chapters_sheet_set_visible() with a slide-up animation.
      */
     s_ch_sheet = lv_obj_create(g_scr_now_playing);
-    lv_obj_set_size(s_ch_sheet, DISPLAY_W, 480);
+    lv_obj_set_size(s_ch_sheet, DISPLAY_W, CH_SHEET_H);
     lv_obj_set_pos(s_ch_sheet, 0, DISPLAY_H);
     lv_obj_set_style_bg_color(s_ch_sheet, lv_color_hex(COL_BG_SHEET),
                                LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -1701,7 +1707,7 @@ void ui_screen_now_playing_create(const spod_app_state_t *state)
 
     /* Chapter list ??? populated lazily by rebuild_chapter_list() */
     s_ch_list = lv_list_create(s_ch_sheet);
-    lv_obj_set_size(s_ch_list, DISPLAY_W, 480 - 68);
+    lv_obj_set_size(s_ch_list, DISPLAY_W, CH_SHEET_H - CH_SHEET_HEADER_H);
     lv_obj_align(s_ch_list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(s_ch_list, lv_color_hex(COL_BG_SHEET),
                                LV_PART_MAIN | LV_STATE_DEFAULT);
