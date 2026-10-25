@@ -34,9 +34,13 @@
 #endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "ping/ping_sock.h"
+#include "esp_timer.h"
 
 #define AUDIO_MOUNT_POINT "/sdcard"
 #define WIFI_UPLOAD_PATH_MAX 160
@@ -89,7 +93,7 @@ static char s_wifi_password[AUDIO_BACKEND_WIFI_PASSWORD_MAX] = "";
 #define WIFI_HTTP_OUT_BUF_SIZE      4096
 #define WIFI_UPLOAD_RECV_TIMEOUT_MAX 8
 #define WIFI_UPLOAD_PROGRESS_STEP_BYTES (256 * 1024)
-#define WIFI_UPLOAD_BROWSER_CHUNK_BYTES (256 * 1024) /* must match the page script */
+#define WIFI_UPLOAD_BROWSER_CHUNK_BYTES (1024 * 1024) /* must match the page script */
 #define WIFI_SCAN_START_SETTLE_MS   900
 #define WIFI_SCAN_RETRY_DELAY_MS    350
 #define WIFI_SCAN_RETRY_COUNT       6
@@ -581,6 +585,77 @@ static void wifi_netif_connected(esp_event_base_t base, int32_t event_id, void *
     esp_netif_action_connected(s_wifi_netif, base, event_id, event_data);
 }
 
+/*
+ * Link check: 20 pings to the gateway right after getting an IP, logged with
+ * the AP (BSSID) and RSSI. Separates radio/mesh-node trouble (loss here) from
+ * forwarding trouble elsewhere in the network (clean here, but unreachable).
+ */
+typedef struct {
+    uint32_t ok;
+    uint32_t lost;
+    uint32_t rtt_sum_ms;
+    uint32_t rtt_max_ms;
+} wifi_link_check_t;
+
+static wifi_link_check_t s_link_check;
+
+static void link_check_on_success(esp_ping_handle_t hdl, void *args)
+{
+    (void)args;
+    uint32_t rtt = 0;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &rtt, sizeof(rtt));
+    s_link_check.ok++;
+    s_link_check.rtt_sum_ms += rtt;
+    if (rtt > s_link_check.rtt_max_ms) {
+        s_link_check.rtt_max_ms = rtt;
+    }
+}
+
+static void link_check_on_timeout(esp_ping_handle_t hdl, void *args)
+{
+    (void)hdl;
+    (void)args;
+    s_link_check.lost++;
+}
+
+static void link_check_on_end(esp_ping_handle_t hdl, void *args)
+{
+    (void)args;
+    wifi_ap_record_t ap = {0};
+    const bool have_ap = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+    const uint32_t total = s_link_check.ok + s_link_check.lost;
+    ESP_LOGI(TAG,
+             "Link check: gateway %u/%u replies, loss %u%%, rtt avg %u ms max %u ms, ap %02x:%02x:%02x:%02x:%02x:%02x rssi %d",
+             (unsigned)s_link_check.ok, (unsigned)total,
+             total ? (unsigned)(s_link_check.lost * 100u / total) : 0u,
+             s_link_check.ok ? (unsigned)(s_link_check.rtt_sum_ms / s_link_check.ok) : 0u,
+             (unsigned)s_link_check.rtt_max_ms,
+             have_ap ? ap.bssid[0] : 0, have_ap ? ap.bssid[1] : 0, have_ap ? ap.bssid[2] : 0,
+             have_ap ? ap.bssid[3] : 0, have_ap ? ap.bssid[4] : 0, have_ap ? ap.bssid[5] : 0,
+             have_ap ? ap.rssi : 0);
+    esp_ping_delete_session(hdl);
+}
+
+static void wifi_link_check_start(const esp_ip4_addr_t *gw)
+{
+    memset(&s_link_check, 0, sizeof(s_link_check));
+    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+    cfg.target_addr.type = IPADDR_TYPE_V4;
+    cfg.target_addr.u_addr.ip4.addr = gw->addr;
+    cfg.count = 20;
+    cfg.interval_ms = 250;
+    cfg.timeout_ms = 1000;
+    esp_ping_callbacks_t cbs = {
+        .on_ping_success = link_check_on_success,
+        .on_ping_timeout = link_check_on_timeout,
+        .on_ping_end = link_check_on_end,
+    };
+    esp_ping_handle_t ping = NULL;
+    if (esp_ping_new_session(&cfg, &cbs, &ping) == ESP_OK) {
+        esp_ping_start(ping);
+    }
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     (void)arg;
@@ -633,6 +708,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         }
         wifi_status_set("Wi-Fi: %s", s_wifi_ip);
+        wifi_link_check_start(&event->ip_info.gw);
     }
 }
 
@@ -678,7 +754,7 @@ static esp_err_t wifi_upload_index_get_handler(httpd_req_t *req)
         "const r=await fetch('/api/delete?path='+encodeURIComponent(p),{method:'POST'});"
         "log(await r.text());await loadList();}"
         "async function uploadChunk(story,file,offset,total){"
-        "const end=Math.min(offset+262144,total);"
+        "const end=Math.min(offset+1048576,total);"
         "const qs='story='+encodeURIComponent(story)+'&filename='+encodeURIComponent(file.name)+'&offset='+offset+'&total='+total;"
         "let last='';"
         "for(let a=1;a<=3;a++){"
@@ -907,6 +983,45 @@ static esp_err_t wifi_upload_api_delete_handler(httpd_req_t *req)
     return httpd_resp_send(req, "Deleted", HTTPD_RESP_USE_STRLEN);
 }
 
+/*
+ * Upload writer: the HTTP task receives into one buffer while this task writes
+ * the previous one to the SD card. Done serially, every SD write (~0.5 s per
+ * 256 KB) stalled the TCP receive window.
+ */
+#define WIFI_UPLOAD_WRITE_BUFS 2
+
+typedef struct {
+    char *buf;
+    size_t len;          /* 0 = stop */
+} upload_block_t;
+
+typedef struct {
+    FILE *fp;
+    QueueHandle_t filled;
+    QueueHandle_t empty;
+    SemaphoreHandle_t done;
+    volatile bool failed;
+    int64_t write_us;
+} upload_writer_t;
+
+static void upload_writer_task(void *arg)
+{
+    upload_writer_t *w = (upload_writer_t *)arg;
+    upload_block_t b;
+    while (xQueueReceive(w->filled, &b, portMAX_DELAY) == pdTRUE && b.len > 0) {
+        if (!w->failed) {
+            const int64_t t0 = esp_timer_get_time();
+            if (fwrite(b.buf, 1, b.len, w->fp) != b.len) {
+                w->failed = true;
+            }
+            w->write_us += esp_timer_get_time() - t0;
+        }
+        (void)xQueueSend(w->empty, &b.buf, portMAX_DELAY);
+    }
+    xSemaphoreGive(w->done);
+    vTaskDelete(NULL);
+}
+
 static esp_err_t wifi_upload_api_upload_handler(httpd_req_t *req)
 {
     if (!wifi_sd_is_ready()) {
@@ -989,19 +1104,44 @@ static esp_err_t wifi_upload_api_upload_handler(httpd_req_t *req)
         }
     }
 
+    const int64_t t_open0 = esp_timer_get_time();
     FILE *fp = fopen(target, upload_offset == 0 ? "wb" : "ab");
+    const int64_t t_open_us = esp_timer_get_time() - t_open0;
+    int64_t t_recv_us = 0;
+    int64_t t_write_us = 0;
     if (!fp) {
         ESP_LOGW(TAG, "Cannot open upload target %s (errno=%d)", target, errno);
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_send(req, "Cannot open target file", HTTPD_RESP_USE_STRLEN);
     }
 
-    char *buf = (char *)heap_caps_malloc(WIFI_UPLOAD_RECV_BUF_SIZE, MALLOC_CAP_8BIT);
-    if (!buf) {
+    char *bufs[WIFI_UPLOAD_WRITE_BUFS] = {0};
+    upload_writer_t writer = {.fp = fp};
+    writer.filled = xQueueCreate(WIFI_UPLOAD_WRITE_BUFS + 1, sizeof(upload_block_t));
+    writer.empty = xQueueCreate(WIFI_UPLOAD_WRITE_BUFS, sizeof(char *));
+    writer.done = xSemaphoreCreateBinary();
+    bool setup_ok = writer.filled && writer.empty && writer.done;
+    for (int i = 0; setup_ok && i < WIFI_UPLOAD_WRITE_BUFS; i++) {
+        bufs[i] = (char *)heap_caps_malloc(WIFI_UPLOAD_RECV_BUF_SIZE, MALLOC_CAP_8BIT);
+        setup_ok = (bufs[i] != NULL) && xQueueSend(writer.empty, &bufs[i], 0) == pdTRUE;
+    }
+    /* SD-only work, so the stack can live in PSRAM. */
+    if (setup_ok &&
+        xTaskCreatePinnedToCoreWithCaps(upload_writer_task, "upload_wr", 4096, &writer, 6, NULL,
+                                        tskNO_AFFINITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        setup_ok = false;
+    }
+    if (!setup_ok) {
+        for (int i = 0; i < WIFI_UPLOAD_WRITE_BUFS; i++) free(bufs[i]);
+        if (writer.filled) vQueueDelete(writer.filled);
+        if (writer.empty) vQueueDelete(writer.empty);
+        if (writer.done) vSemaphoreDelete(writer.done);
         fclose(fp);
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_send(req, "No upload buffer", HTTPD_RESP_USE_STRLEN);
     }
+    char *buf = NULL;
+    size_t buf_len = 0;
 
     int remaining = req->content_len;
     int timeout_count = 0;
@@ -1020,11 +1160,21 @@ static esp_err_t wifi_upload_api_upload_handler(httpd_req_t *req)
              (unsigned)upload_total);
 
     while (remaining > 0) {
-        int chunk = remaining;
-        if (chunk > WIFI_UPLOAD_RECV_BUF_SIZE) {
-            chunk = WIFI_UPLOAD_RECV_BUF_SIZE;
+        if (writer.failed) {
+            failed = true;
+            break;
         }
-        int received = httpd_req_recv(req, buf, chunk);
+        if (!buf) {
+            (void)xQueueReceive(writer.empty, &buf, portMAX_DELAY);
+            buf_len = 0;
+        }
+        int chunk = remaining;
+        if (chunk > (int)(WIFI_UPLOAD_RECV_BUF_SIZE - buf_len)) {
+            chunk = (int)(WIFI_UPLOAD_RECV_BUF_SIZE - buf_len);
+        }
+        const int64_t t_r0 = esp_timer_get_time();
+        int received = httpd_req_recv(req, buf + buf_len, chunk);
+        t_recv_us += esp_timer_get_time() - t_r0;
         if (received == HTTPD_SOCK_ERR_TIMEOUT) {
             timeout_count++;
             ESP_LOGW(TAG,
@@ -1046,11 +1196,13 @@ static esp_err_t wifi_upload_api_upload_handler(httpd_req_t *req)
             failed = true;
             break;
         }
-        if (fwrite(buf, 1, (size_t)received, fp) != (size_t)received) {
-            failed = true;
-            break;
-        }
+        buf_len += (size_t)received;
         remaining -= received;
+        if (buf_len == WIFI_UPLOAD_RECV_BUF_SIZE || remaining == 0) {
+            upload_block_t b = {.buf = buf, .len = buf_len};
+            (void)xQueueSend(writer.filled, &b, portMAX_DELAY);
+            buf = NULL;
+        }
         written += (size_t)received;
         timeout_count = 0;
         if (written - last_progress_log >= WIFI_UPLOAD_PROGRESS_STEP_BYTES || remaining == 0) {
@@ -1063,8 +1215,26 @@ static esp_err_t wifi_upload_api_upload_handler(httpd_req_t *req)
             last_progress_log = written;
         }
     }
-    free(buf);
+    {
+        upload_block_t stop = {.buf = NULL, .len = 0};
+        (void)xQueueSend(writer.filled, &stop, portMAX_DELAY);
+        (void)xSemaphoreTake(writer.done, portMAX_DELAY);
+    }
+    if (writer.failed) {
+        failed = true;
+    }
+    t_write_us = writer.write_us;
+    for (int i = 0; i < WIFI_UPLOAD_WRITE_BUFS; i++) free(bufs[i]);
+    vQueueDelete(writer.filled);
+    vQueueDelete(writer.empty);
+    vSemaphoreDelete(writer.done);
+    const int64_t t_c0 = esp_timer_get_time();
     fclose(fp);
+    const int64_t t_close_us = esp_timer_get_time() - t_c0;
+    /* One line per request: where upload time goes (network receive vs SD write). */
+    ESP_LOGI(TAG, "Upload timing: %u B, recv %u ms, write %u ms, open %u ms, close %u ms",
+             (unsigned)written, (unsigned)(t_recv_us / 1000), (unsigned)(t_write_us / 1000),
+             (unsigned)(t_open_us / 1000), (unsigned)(t_close_us / 1000));
 
     if (failed) {
         if (upload_offset == 0) {

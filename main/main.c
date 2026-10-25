@@ -150,6 +150,12 @@ static void hw_shutdown_task(void *arg)
         ESP_LOGW(TAG, "audio_backend_prepare_shutdown returned %s", esp_err_to_name(ret));
     }
 
+    /*
+     * Leave the network cleanly (deauth). Otherwise a WPA3/PMF mesh keeps the old
+     * association and refuses or misroutes the next connection after power-on.
+     */
+    (void)audio_backend_wifi_upload_stop();
+
     /* Give codec/amp line a short settle window before cutting power. */
     vTaskDelay(pdMS_TO_TICKS(80));
 
