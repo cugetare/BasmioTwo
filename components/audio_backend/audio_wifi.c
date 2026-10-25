@@ -89,7 +89,7 @@ static char s_wifi_password[AUDIO_BACKEND_WIFI_PASSWORD_MAX] = "";
 #define WIFI_HTTP_OUT_BUF_SIZE      4096
 #define WIFI_UPLOAD_RECV_TIMEOUT_MAX 8
 #define WIFI_UPLOAD_PROGRESS_STEP_BYTES (256 * 1024)
-#define WIFI_UPLOAD_BROWSER_CHUNK_BYTES (64 * 1024)
+#define WIFI_UPLOAD_BROWSER_CHUNK_BYTES (256 * 1024) /* must match the page script */
 #define WIFI_SCAN_START_SETTLE_MS   900
 #define WIFI_SCAN_RETRY_DELAY_MS    350
 #define WIFI_SCAN_RETRY_COUNT       6
@@ -678,7 +678,7 @@ static esp_err_t wifi_upload_index_get_handler(httpd_req_t *req)
         "const r=await fetch('/api/delete?path='+encodeURIComponent(p),{method:'POST'});"
         "log(await r.text());await loadList();}"
         "async function uploadChunk(story,file,offset,total){"
-        "const end=Math.min(offset+65536,total);"
+        "const end=Math.min(offset+262144,total);"
         "const qs='story='+encodeURIComponent(story)+'&filename='+encodeURIComponent(file.name)+'&offset='+offset+'&total='+total;"
         "let last='';"
         "for(let a=1;a<=3;a++){"
@@ -1010,7 +1010,8 @@ static esp_err_t wifi_upload_api_upload_handler(httpd_req_t *req)
     bool failed = false;
     bool timed_out = false;
 
-    ESP_LOGI(TAG,
+    /* Per-chunk logs at DEBUG: three 115200-baud UART lines per chunk stalled the upload. */
+    ESP_LOGD(TAG,
              "Upload chunk start: %s/%s offset=%u chunk=%d total=%u",
              story_name,
              file_name,
@@ -1053,7 +1054,7 @@ static esp_err_t wifi_upload_api_upload_handler(httpd_req_t *req)
         written += (size_t)received;
         timeout_count = 0;
         if (written - last_progress_log >= WIFI_UPLOAD_PROGRESS_STEP_BYTES || remaining == 0) {
-            ESP_LOGI(TAG,
+            ESP_LOGD(TAG,
                      "Upload progress: %s/%s %u/%u bytes",
                      story_name,
                      file_name,
@@ -1082,7 +1083,7 @@ static esp_err_t wifi_upload_api_upload_handler(httpd_req_t *req)
 
     const uint64_t next_offset = upload_offset + written;
     const bool done = (next_offset >= upload_total);
-    ESP_LOGI(TAG,
+    ESP_LOG_LEVEL_LOCAL(done ? ESP_LOG_INFO : ESP_LOG_DEBUG, TAG,
              "Upload chunk complete: %s/%s next=%u/%u%s",
              story_name,
              file_name,

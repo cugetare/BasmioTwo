@@ -68,6 +68,8 @@ static const char *TAG = "audio_backend";
 #define AUDIO_DEFAULT_RATE_HZ       44100U
 #define MP3_PLAY_TASK_STACK_BYTES   (32 * 1024)
 #define MP3_PLAY_TASK_PRIORITY      11
+/* Core 1 is otherwise idle; core 0 runs LVGL, Wi-Fi and lwIP, so decoding there starved the UI. */
+#define MP3_PLAY_TASK_CORE          1
 #define MP3_INPUT_BUFFER_SIZE       (16 * 1024)
 #define MP3_OUTPUT_BUFFER_SIZE      (8 * 1024)
 #define MP3_PAUSE_POLL_MS           20
@@ -2616,6 +2618,8 @@ static esp_err_t init_sd(void)
     };
 
     esp_err_t last_err = ESP_FAIL;
+    /* High speed (40 MHz) is tried first; cards or wiring that cannot keep up fall back to 20 MHz. */
+    int freq_khz = CONFIG_AUDIO_BACKEND_SDMMC_MAX_FREQ_KHZ;
     for (int pass = 0; pass < 4; pass++) {
         uint8_t width = primary_width;
         bool use_ldo = false;
@@ -2650,7 +2654,7 @@ static esp_err_t init_sd(void)
          * so the two SDIO clients do not fight over the same host slot.
          */
         host.slot = SDMMC_HOST_SLOT_0;
-        host.max_freq_khz = CONFIG_AUDIO_BACKEND_SDMMC_MAX_FREQ_KHZ;
+        host.max_freq_khz = freq_khz;
         host.flags &= ~SDMMC_HOST_FLAG_DDR;
 
         sdmmc_slot_config_t slot_cfg = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -2720,6 +2724,11 @@ static esp_err_t init_sd(void)
         }
 #endif
         (void)sdmmc_host_deinit();
+        if (freq_khz > SDMMC_FREQ_DEFAULT) {
+            ESP_LOGW(TAG, "Retrying SD mount at %d kHz", SDMMC_FREQ_DEFAULT);
+            freq_khz = SDMMC_FREQ_DEFAULT;
+            pass--;
+        }
     }
 
     ESP_LOGE(TAG, "SD mount failed after retries (%s)", esp_err_to_name(last_err));
@@ -2897,8 +2906,12 @@ static esp_err_t init_i2s(void)
     }
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    /*
+     * 16 x 256 frames = ~93 ms at 44.1 kHz, 16 KB of internal DMA RAM. 512 frames
+     * doubled that; with decoding on its own core the shorter buffer has headroom.
+     */
     chan_cfg.dma_desc_num = 16;
-    chan_cfg.dma_frame_num = 512;
+    chan_cfg.dma_frame_num = 256;
     chan_cfg.intr_priority = 2;
     chan_cfg.auto_clear = true;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_i2s_tx, NULL), TAG, "i2s_new_channel failed");
@@ -3101,25 +3114,27 @@ static esp_err_t audio_backend_play_chapter_internal(uint8_t story_id, uint8_t c
     vTaskSuspendAll();
     BaseType_t created = pdFAIL;
 #if CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM && CONFIG_SPIRAM
-    created = xTaskCreateWithCaps(mp3_playback_task,
-                                  "mp3_play",
-                                  MP3_PLAY_TASK_STACK_BYTES,
-                                  NULL,
-                                  MP3_PLAY_TASK_PRIORITY,
-                                  &task,
-                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    created = xTaskCreatePinnedToCoreWithCaps(mp3_playback_task,
+                                              "mp3_play",
+                                              MP3_PLAY_TASK_STACK_BYTES,
+                                              NULL,
+                                              MP3_PLAY_TASK_PRIORITY,
+                                              &task,
+                                              MP3_PLAY_TASK_CORE,
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created == pdPASS && task != NULL) {
         task_with_caps = true;
     } else
 #endif
     {
         task = NULL;
-        created = xTaskCreate(mp3_playback_task,
-                              "mp3_play",
-                              MP3_PLAY_TASK_STACK_BYTES,
-                              NULL,
-                              MP3_PLAY_TASK_PRIORITY,
-                              &task);
+        created = xTaskCreatePinnedToCore(mp3_playback_task,
+                                          "mp3_play",
+                                          MP3_PLAY_TASK_STACK_BYTES,
+                                          NULL,
+                                          MP3_PLAY_TASK_PRIORITY,
+                                          &task,
+                                          MP3_PLAY_TASK_CORE);
     }
     if (created == pdPASS && task != NULL) {
         playback_set_task(task, task_with_caps);
