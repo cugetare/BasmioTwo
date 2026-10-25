@@ -85,7 +85,8 @@ static char s_wifi_password[AUDIO_BACKEND_WIFI_PASSWORD_MAX] = "";
 #define WIFI_FAIL_BIT               BIT1
 #define WIFI_STA_STARTED_BIT        BIT2
 #define WIFI_MAX_RETRY              8
-#define WIFI_UPLOAD_RECV_BUF_SIZE   2048
+#define WIFI_UPLOAD_RECV_BUF_SIZE   (16 * 1024)
+#define WIFI_HTTP_OUT_BUF_SIZE      4096
 #define WIFI_UPLOAD_RECV_TIMEOUT_MAX 8
 #define WIFI_UPLOAD_PROGRESS_STEP_BYTES (256 * 1024)
 #define WIFI_UPLOAD_BROWSER_CHUNK_BYTES (64 * 1024)
@@ -161,73 +162,99 @@ static bool parse_u64_dec(const char *text, uint64_t *out_value)
     return true;
 }
 
-static esp_err_t http_send_chunk(httpd_req_t *req, const char *text)
+/*
+ * Buffered chunked response: small JSON fragments are collected and sent in
+ * WIFI_HTTP_OUT_BUF_SIZE pieces instead of one TCP write per fragment.
+ */
+typedef struct {
+    httpd_req_t *req;
+    char *buf;
+    size_t len;
+} http_out_t;
+
+static void http_out_init(http_out_t *out, httpd_req_t *req)
+{
+    out->req = req;
+    out->len = 0;
+    out->buf = (char *)malloc(WIFI_HTTP_OUT_BUF_SIZE);
+}
+
+static esp_err_t http_out_flush(http_out_t *out)
+{
+    if (out->len == 0) {
+        return ESP_OK;
+    }
+    esp_err_t err = httpd_resp_send_chunk(out->req, out->buf, out->len);
+    out->len = 0;
+    return err;
+}
+
+static esp_err_t http_out_write(http_out_t *out, const char *data, size_t len)
+{
+    if (!out->buf) {
+        return httpd_resp_send_chunk(out->req, data, len);
+    }
+    while (len > 0) {
+        if (out->len == WIFI_HTTP_OUT_BUF_SIZE) {
+            esp_err_t err = http_out_flush(out);
+            if (err != ESP_OK) return err;
+        }
+        size_t n = WIFI_HTTP_OUT_BUF_SIZE - out->len;
+        if (n > len) n = len;
+        memcpy(out->buf + out->len, data, n);
+        out->len += n;
+        data += n;
+        len -= n;
+    }
+    return ESP_OK;
+}
+
+/* Flushes pending data, terminates the chunked response and frees the buffer. */
+static esp_err_t http_out_finish(http_out_t *out, esp_err_t err)
+{
+    if (err == ESP_OK && out->buf) err = http_out_flush(out);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(out->req, NULL, 0);
+    free(out->buf);
+    out->buf = NULL;
+    return err;
+}
+
+static esp_err_t http_send_chunk(http_out_t *out, const char *text)
 {
     if (!text) {
         return ESP_OK;
     }
-    return httpd_resp_send_chunk(req, text, HTTPD_RESP_USE_STRLEN);
+    return http_out_write(out, text, strlen(text));
 }
 
-static esp_err_t http_send_json_string(httpd_req_t *req, const char *text)
+static esp_err_t http_send_json_string(http_out_t *out, const char *text)
 {
-    esp_err_t err = httpd_resp_send_chunk(req, "\"", 1);
+    esp_err_t err = http_out_write(out, "\"", 1);
+    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); err == ESP_OK && *p; ++p) {
+        const unsigned char c = *p;
+        char esc[7];
+
+        if (c == '"' || c == '\\') {
+            esc[0] = '\\';
+            esc[1] = (char)c;
+            err = http_out_write(out, esc, 2);
+        } else if (c == '\n') {
+            err = http_out_write(out, "\\n", 2);
+        } else if (c == '\r') {
+            err = http_out_write(out, "\\r", 2);
+        } else if (c == '\t') {
+            err = http_out_write(out, "\\t", 2);
+        } else if (c < 0x20) {
+            snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+            err = http_out_write(out, esc, 6);
+        } else {
+            err = http_out_write(out, (const char *)p, 1);
+        }
+    }
     if (err != ESP_OK) {
         return err;
     }
-
-    char buf[96];
-    size_t w = 0;
-    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; ++p) {
-        const unsigned char c = *p;
-        const char *escape = NULL;
-        char unicode_escape[7];
-
-        if (c == '"' || c == '\\') {
-            if (w + 2 >= sizeof(buf)) {
-                err = httpd_resp_send_chunk(req, buf, w);
-                if (err != ESP_OK) return err;
-                w = 0;
-            }
-            buf[w++] = '\\';
-            buf[w++] = (char)c;
-            continue;
-        } else if (c == '\n') {
-            escape = "\\n";
-        } else if (c == '\r') {
-            escape = "\\r";
-        } else if (c == '\t') {
-            escape = "\\t";
-        } else if (c < 0x20) {
-            snprintf(unicode_escape, sizeof(unicode_escape), "\\u%04x", (unsigned)c);
-            escape = unicode_escape;
-        }
-
-        if (escape) {
-            const size_t len = strlen(escape);
-            if (w + len >= sizeof(buf)) {
-                err = httpd_resp_send_chunk(req, buf, w);
-                if (err != ESP_OK) return err;
-                w = 0;
-            }
-            memcpy(buf + w, escape, len);
-            w += len;
-            continue;
-        }
-
-        if (w + 1 >= sizeof(buf)) {
-            err = httpd_resp_send_chunk(req, buf, w);
-            if (err != ESP_OK) return err;
-            w = 0;
-        }
-        buf[w++] = (char)c;
-    }
-
-    if (w > 0) {
-        err = httpd_resp_send_chunk(req, buf, w);
-        if (err != ESP_OK) return err;
-    }
-    return httpd_resp_send_chunk(req, "\"", 1);
+    return http_out_write(out, "\"", 1);
 }
 
 static void sanitize_path_component(const char *in, char *out, size_t out_size, const char *fallback)
@@ -749,7 +776,9 @@ static esp_err_t wifi_upload_api_list_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
-    esp_err_t err = http_send_chunk(req, "{\"ok\":true,\"stories\":[");
+    http_out_t out;
+    http_out_init(&out, req);
+    esp_err_t err = http_send_chunk(&out, "{\"ok\":true,\"stories\":[");
     bool first_story = true;
     uint64_t total_bytes = 0;
     struct dirent *story_ent;
@@ -770,16 +799,16 @@ static esp_err_t wifi_upload_api_list_handler(httpd_req_t *req)
         }
 
         if (!first_story) {
-            err = http_send_chunk(req, ",");
+            err = http_send_chunk(&out, ",");
             if (err != ESP_OK) break;
         }
         first_story = false;
 
-        err = http_send_chunk(req, "{\"name\":");
-        if (err == ESP_OK) err = http_send_json_string(req, story_ent->d_name);
-        if (err == ESP_OK) err = http_send_chunk(req, ",\"path\":");
-        if (err == ESP_OK) err = http_send_json_string(req, story_ent->d_name);
-        if (err == ESP_OK) err = http_send_chunk(req, ",\"files\":[");
+        err = http_send_chunk(&out, "{\"name\":");
+        if (err == ESP_OK) err = http_send_json_string(&out, story_ent->d_name);
+        if (err == ESP_OK) err = http_send_chunk(&out, ",\"path\":");
+        if (err == ESP_OK) err = http_send_json_string(&out, story_ent->d_name);
+        if (err == ESP_OK) err = http_send_chunk(&out, ",\"files\":[");
         if (err != ESP_OK) break;
 
         DIR *story_dir = opendir(story_path);
@@ -808,24 +837,24 @@ static esp_err_t wifi_upload_api_list_handler(httpd_req_t *req)
                 }
 
                 if (!first_file) {
-                    err = http_send_chunk(req, ",");
+                    err = http_send_chunk(&out, ",");
                     if (err != ESP_OK) break;
                 }
                 first_file = false;
 
                 char meta[80];
                 snprintf(meta, sizeof(meta), ",\"size\":%llu}", (unsigned long long)file_st.st_size);
-                err = http_send_chunk(req, "{\"name\":");
-                if (err == ESP_OK) err = http_send_json_string(req, file_ent->d_name);
-                if (err == ESP_OK) err = http_send_chunk(req, ",\"path\":");
-                if (err == ESP_OK) err = http_send_json_string(req, rel_path);
-                if (err == ESP_OK) err = http_send_chunk(req, meta);
+                err = http_send_chunk(&out, "{\"name\":");
+                if (err == ESP_OK) err = http_send_json_string(&out, file_ent->d_name);
+                if (err == ESP_OK) err = http_send_chunk(&out, ",\"path\":");
+                if (err == ESP_OK) err = http_send_json_string(&out, rel_path);
+                if (err == ESP_OK) err = http_send_chunk(&out, meta);
             }
             closedir(story_dir);
         }
 
         if (err == ESP_OK) {
-            err = http_send_chunk(req, "]}");
+            err = http_send_chunk(&out, "]}");
         }
     }
     closedir(root);
@@ -833,12 +862,9 @@ static esp_err_t wifi_upload_api_list_handler(httpd_req_t *req)
     if (err == ESP_OK) {
         char tail[64];
         snprintf(tail, sizeof(tail), "],\"bytes\":%llu}", (unsigned long long)total_bytes);
-        err = http_send_chunk(req, tail);
+        err = http_send_chunk(&out, tail);
     }
-    if (err == ESP_OK) {
-        err = httpd_resp_send_chunk(req, NULL, 0);
-    }
-    return err;
+    return http_out_finish(&out, err);
 }
 
 static esp_err_t wifi_upload_api_delete_handler(httpd_req_t *req)
@@ -1071,8 +1097,10 @@ static esp_err_t wifi_upload_api_upload_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
-    err = http_send_chunk(req, "{\"ok\":true,\"file\":");
-    if (err == ESP_OK) err = http_send_json_string(req, rel_file);
+    http_out_t out;
+    http_out_init(&out, req);
+    err = http_send_chunk(&out, "{\"ok\":true,\"file\":");
+    if (err == ESP_OK) err = http_send_json_string(&out, rel_file);
     if (err == ESP_OK) {
         char meta[96];
         snprintf(meta,
@@ -1083,10 +1111,9 @@ static esp_err_t wifi_upload_api_upload_handler(httpd_req_t *req)
                  (unsigned)next_offset,
                  (unsigned)upload_total,
                  done ? "true" : "false");
-        err = http_send_chunk(req, meta);
+        err = http_send_chunk(&out, meta);
     }
-    if (err == ESP_OK) err = httpd_resp_send_chunk(req, NULL, 0);
-    return err;
+    return http_out_finish(&out, err);
 }
 
 static esp_err_t wifi_upload_api_finalize_handler(httpd_req_t *req)
@@ -1119,7 +1146,8 @@ static esp_err_t wifi_upload_start_http_server(void)
     cfg.ctrl_port = (cfg.server_port == 65535) ? 32768 : (cfg.server_port + 1);
     cfg.stack_size = 12 * 1024;
     cfg.max_uri_handlers = 6;
-    cfg.max_open_sockets = 3;
+    cfg.max_open_sockets = 7;
+    cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 15;
     cfg.send_wait_timeout = 15;
 
@@ -1267,6 +1295,8 @@ static esp_err_t wifi_start_scan_only(void)
     }
 
     s_wifi_started = true;
+    /* Modem sleep delays inbound packets by up to a DTIM interval; keep the radio awake for the portal. */
+    (void)esp_wifi_set_ps(WIFI_PS_NONE);
     s_wifi_connected = false;
     s_wifi_ip[0] = '\0';
 
@@ -1322,6 +1352,8 @@ static esp_err_t wifi_connect_sta_for_scan(void)
     }
 
     s_wifi_started = true;
+    /* Modem sleep delays inbound packets by up to a DTIM interval; keep the radio awake for the portal. */
+    (void)esp_wifi_set_ps(WIFI_PS_NONE);
     s_wifi_connected = false;
     s_wifi_ip[0] = '\0';
 
@@ -1634,6 +1666,8 @@ esp_err_t audio_backend_wifi_upload_start(void)
     }
 
     s_wifi_started = true;
+    /* Modem sleep delays inbound packets by up to a DTIM interval; keep the radio awake for the portal. */
+    (void)esp_wifi_set_ps(WIFI_PS_NONE);
     s_wifi_connected = false;
     s_wifi_ip[0] = '\0';
     wifi_status_set("Wi-Fi: connecting...");

@@ -59,4 +59,18 @@ menu "Basmio Board Diagnostics"
             Enable only when you want the C6 ROM download bootloader instead
             of the currently installed firmware boot log.
 
+    config BASMIO_PERF_STATS
+        bool "Log per-task CPU load and heap periodically"
+        default y
+        select FREERTOS_USE_TRACE_FACILITY
+        select FREERTOS_GENERATE_RUN_TIME_STATS
+        help
+            Prints the CPU share of every task and free heap to the console.
+
+    config BASMIO_PERF_STATS_PERIOD_MS
+        int "Perf stats period (ms)"
+        depends on BASMIO_PERF_STATS
+        range 1000 60000
+        default 5000
+
 endmenu

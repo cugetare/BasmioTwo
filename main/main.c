@@ -6,6 +6,7 @@
 #include "ui_app.h"
 #include "ui_screens.h"
 #include "audio_backend.h"
+#include "perf_stats.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include "esp_app_desc.h"
@@ -465,10 +466,12 @@ void app_main(void)
     lv_timer_create(playback_progress_cb, 250, NULL);
     lv_timer_create(idle_check_cb, 1000, NULL); // check la 1 sec
     lv_timer_create(hw_buttons_poll_cb, HW_BTN_POLL_MS, NULL);
+    perf_stats_start();
     while (1) {
         uint32_t delay = lv_timer_handler();
-        //lv_refr_now(NULL);   // <-- AICI, forÈ›Äƒm reÃ®mprospÄƒtarea ecranului imediat dupÄƒ procesarea timerelor
-        vTaskDelay(pdMS_TO_TICKS(delay ? delay : 1));
+        /* pdMS_TO_TICKS() rounds sub-tick delays down to 0, which only yields and keeps CPU0 busy. */
+        TickType_t ticks = pdMS_TO_TICKS(delay);
+        vTaskDelay(ticks > 0 ? ticks : 1);
     }
 }
 

@@ -1482,12 +1482,23 @@ static void persist_active_story_progress(bool playback_finished)
     story_json_save(story);
 }
 
-static int16_t apply_volume(int16_t sample, uint8_t volume)
+/*
+ * Perceived loudness grows roughly with amplitude^0.6, so a linear slider
+ * jumps at the bottom and flattens out above the middle. Squaring the slider
+ * position gives an approximately even loudness step across 0..100
+ * (50 -> -12 dB, 25 -> -24 dB, 10 -> -40 dB). Returns Q15 gain.
+ */
+static int32_t volume_to_gain_q15(uint8_t volume)
 {
     if (volume >= 100) {
-        return sample;
+        return 32768;
     }
-    int32_t scaled = ((int32_t)sample * (int32_t)volume) / 100;
+    return ((int32_t)volume * (int32_t)volume * 32768) / 10000;
+}
+
+static int16_t apply_volume(int16_t sample, int32_t gain_q15)
+{
+    int32_t scaled = ((int32_t)sample * gain_q15) >> 15;
     if (scaled > INT16_MAX) {
         scaled = INT16_MAX;
     } else if (scaled < INT16_MIN) {
@@ -2384,6 +2395,7 @@ static void mp3_playback_task(void *arg)
                 tone_runtime_configure(&tone_rt, sample_rate, volume);
                 sound_enricher_runtime_configure(&sound_enricher_rt, sample_rate, volume);
                 const bool tone_active = tone_rt.active;
+                const int32_t gain_q15 = volume_to_gain_q15(volume);
 
                 const int16_t *src = (const int16_t *)out.buffer;
                 const bool mono_enabled = s_mono_enabled;
@@ -2395,7 +2407,7 @@ static void mp3_playback_task(void *arg)
                         } else {
                             mono = downmix_stereo_to_mono(src[i * channels], src[i * channels + 1u]);
                         }
-                        int16_t smp = apply_volume((int16_t)mono, volume);
+                        int16_t smp = apply_volume((int16_t)mono, gain_q15);
                         i2s_buf[i * 2u] = smp;
                         i2s_buf[i * 2u + 1u] = smp;
                     }
@@ -2405,8 +2417,8 @@ static void mp3_playback_task(void *arg)
                     }
                 } else {
                     for (size_t i = 0; i < frames; i++) {
-                        i2s_buf[i * 2u] = apply_volume(src[i * channels], volume);
-                        i2s_buf[i * 2u + 1u] = apply_volume(src[i * channels + 1u], volume);
+                        i2s_buf[i * 2u] = apply_volume(src[i * channels], gain_q15);
+                        i2s_buf[i * 2u + 1u] = apply_volume(src[i * channels + 1u], gain_q15);
                     }
                 }
                 sound_enricher_runtime_process(&sound_enricher_rt, i2s_buf, frames);
