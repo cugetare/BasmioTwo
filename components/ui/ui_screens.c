@@ -1750,14 +1750,13 @@ void ui_screen_now_playing_refresh(const spod_app_state_t *state)
     }
 
     /*
-     * Middle dot separator: \xC2\xB7 is U+00B7 in UTF-8.
-     * Requires LV_TXT_ENC_UTF8 (default in LVGL v8) and the glyph present
-     * in lv_font_montserrat_16 (included in the standard Latin range build).
+     * Separator: the built-in Montserrat fonts only carry ASCII plus the LVGL
+     * symbols, so U+00B7 rendered as a box. LV_SYMBOL_BULLET (U+2022) is in them.
      */
     const spod_chapter_t *ch = &story->chapters[state->current_chapter];
     if (chapter_changed) {
         char ch_buf[80];
-        snprintf(ch_buf, sizeof(ch_buf), "Chapter %u  \xC2\xB7  %s",
+        snprintf(ch_buf, sizeof(ch_buf), "Chapter %u  " LV_SYMBOL_BULLET "  %s",
                  (unsigned)(state->current_chapter + 1u), ch->title);
         lv_label_set_text(s_np_chapter_lbl, ch_buf);
         s_np_cached_chapter = state->current_chapter;

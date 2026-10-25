@@ -59,6 +59,11 @@ static uint32_t s_hw_sleep_press_start_ms = 0;
 static bool s_hw_sleep_long_handled = false;
 #endif
 
+extern const uint8_t boot_logo_ro_start[] asm("_binary_boot_ro_basmio_png_start");
+extern const uint8_t boot_logo_ro_end[] asm("_binary_boot_ro_basmio_png_end");
+extern const uint8_t boot_logo_en_start[] asm("_binary_boot_en_basmio_png_start");
+extern const uint8_t boot_logo_en_end[] asm("_binary_boot_en_basmio_png_end");
+
 static void lvgl_tick_cb(void *arg)
 {
     lv_tick_inc(1);
@@ -85,38 +90,33 @@ static void boot_show_screen(void)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_remove_style_all(scr);
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0xFDFEFE), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-    lv_obj_t *frame = lv_obj_create(scr);
-    lv_obj_remove_style_all(frame);
-    lv_obj_set_size(frame, 420, 170);
-    lv_obj_align(frame, LV_ALIGN_CENTER, 0, -6);
-    lv_obj_set_style_radius(frame, 18, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(frame, lv_color_hex(0xF4F1EC), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(frame, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(frame, 3, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_color(frame, lv_color_hex(0x1A1612), LV_PART_MAIN | LV_STATE_DEFAULT);
+    /* Full-screen 480x320 PNG, decoded by LVGL's PNG decoder; language follows settings. */
+    const spod_app_state_t *state = ui_app_get_state();
+    const bool ro = (state && state->language != 0);
+    static lv_img_dsc_t logo_ro;
+    static lv_img_dsc_t logo_en;
+    if (!logo_ro.data) {
+        logo_ro.header.cf = LV_IMG_CF_TRUE_COLOR_ALPHA; /* what lv_png converts the PNG to */
+        logo_ro.data = boot_logo_ro_start;
+        logo_ro.data_size = (uint32_t)(boot_logo_ro_end - boot_logo_ro_start);
+        logo_en.header.cf = LV_IMG_CF_TRUE_COLOR_ALPHA; /* what lv_png converts the PNG to */
+        logo_en.data = boot_logo_en_start;
+        logo_en.data_size = (uint32_t)(boot_logo_en_end - boot_logo_en_start);
+    }
+    lv_obj_t *logo = lv_img_create(scr);
+    lv_img_set_src(logo, ro ? &logo_ro : &logo_en);
+    lv_obj_center(logo);
 
-    lv_obj_t *title = lv_label_create(frame);
-    lv_label_set_text(title, "BasmioTwo");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_48, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_color(title, lv_color_hex(0x1A1612), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
-
-    lv_obj_t *sub = lv_label_create(frame);
-    lv_label_set_text(sub, "Display test");
-    lv_obj_set_style_text_font(sub, &lv_font_montserrat_20, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_color(sub, lv_color_hex(0x5A534D), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 92);
-
-    lv_obj_t *dot = lv_obj_create(frame);
-    lv_obj_set_size(dot, 16, 16);
+    lv_obj_t *dot = lv_obj_create(scr);
+    lv_obj_set_size(dot, 10, 10);
     lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(dot, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(dot, lv_color_hex(0xE8A44A), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(dot, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_align(dot, LV_ALIGN_BOTTOM_MID, 0, -18);
 
     lv_anim_t a;
     lv_anim_init(&a);
