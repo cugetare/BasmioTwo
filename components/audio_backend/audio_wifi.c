@@ -1145,6 +1145,13 @@ static esp_err_t wifi_upload_start_http_server(void)
     cfg.server_port = CONFIG_AUDIO_BACKEND_WIFI_HTTP_PORT;
     cfg.ctrl_port = (cfg.server_port == 65535) ? 32768 : (cfg.server_port + 1);
     cfg.stack_size = 12 * 1024;
+#if CONFIG_SPIRAM && CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+    /*
+     * Handlers only touch the SD card (no NVS/flash writes), so the stack can
+     * live in PSRAM; that frees 12 KB of the internal RAM Wi-Fi needs.
+     */
+    cfg.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+#endif
     cfg.max_uri_handlers = 6;
     cfg.max_open_sockets = 7;
     cfg.lru_purge_enable = true;
@@ -1480,6 +1487,18 @@ esp_err_t audio_backend_wifi_scan(audio_backend_wifi_ap_t *aps, size_t max_aps, 
      * hosted link. This is heavier than native Wi-Fi, but it avoids the endless
      * ESP_ERR_WIFI_STATE loop from the C6 firmware.
      */
+#if CONFIG_SOC_WIFI_SUPPORTED
+    /* Native Wi-Fi (ESP32-S3) scans from any STA state; leave a live link and portal alone. */
+    (void)was_running;
+    if (!s_wifi_started) {
+        wifi_status_set("Wi-Fi scan: starting STA...");
+        err = wifi_start_scan_only();
+        if (err != ESP_OK) {
+            return err;
+        }
+        started_for_scan = true;
+    }
+#else
     if (!s_wifi_connected) {
         if (s_wifi_started) {
             (void)audio_backend_wifi_upload_stop();
@@ -1499,9 +1518,11 @@ esp_err_t audio_backend_wifi_scan(audio_backend_wifi_ap_t *aps, size_t max_aps, 
         }
         started_for_scan = !was_running;
     }
+#endif
 
     wifi_status_set("Wi-Fi: scanning...");
 
+#if !CONFIG_SOC_WIFI_SUPPORTED
     /*
      * ESP-Hosted reports WIFI_EVENT_STA_START before the C6 is always
      * ready to accept a scan RPC. Settle here even if Wi-Fi was already
@@ -1510,6 +1531,7 @@ esp_err_t audio_backend_wifi_scan(audio_backend_wifi_ap_t *aps, size_t max_aps, 
      */
     ESP_LOGI(TAG, "Wi-Fi scan: settle %ums before scan_start", (unsigned)WIFI_SCAN_START_SETTLE_MS);
     vTaskDelay(pdMS_TO_TICKS(WIFI_SCAN_START_SETTLE_MS));
+#endif
 
     wifi_scan_config_t scan_cfg = {
         .ssid = NULL,

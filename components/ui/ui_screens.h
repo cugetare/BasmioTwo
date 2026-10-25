@@ -205,6 +205,13 @@ void ui_screen_wifi_settings_refresh(const spod_app_state_t *state);
  */
 void ui_chapters_sheet_set_visible(bool visible, const spod_app_state_t *state);
 
+/**
+ * @brief Reconnect to the saved network at boot when Wi-Fi is enabled.
+ *
+ * Runs on the Wi-Fi worker task; the portal starts once connected.
+ */
+void ui_wifi_autostart(const spod_app_state_t *state);
+
 /* ------------------------------------------------------------------ */
 /*  Toast                                                               */
 /* ------------------------------------------------------------------ */

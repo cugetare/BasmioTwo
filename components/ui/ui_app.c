@@ -980,7 +980,14 @@ void ui_app_set_language(uint8_t language)
 
 void ui_app_set_wifi_enabled(bool enabled)
 {
+    if (s_state.wifi_enabled == enabled) {
+        return;
+    }
     s_state.wifi_enabled = enabled;
+    esp_err_t err = settings_save_to_nvs();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi setting save failed (%s)", esp_err_to_name(err));
+    }
 }
 
 void ui_app_stop_playback(void)
@@ -1148,4 +1155,6 @@ void ui_app_init(void)
 
     lv_disp_load_scr(g_scr_library);
     s_state.current_screen = SCREEN_LIBRARY;
+
+    ui_wifi_autostart(&s_state);
 }

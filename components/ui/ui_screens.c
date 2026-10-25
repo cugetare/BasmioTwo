@@ -2175,10 +2175,15 @@ static void wifi_async_complete_cb(void *arg)
     }
     if (type == WIFI_JOB_CONNECT && result == ESP_OK) {
         wifi_password_dialog_close();
+        /* Joining a network turns Wi-Fi on, so it reconnects on the next boot. */
+        settings_draft()->wifi_enabled = true;
+        settings_switch_set(s_set_wifi_switch, true);
+        ui_app_set_wifi_enabled(true);
     }
     if (type == WIFI_JOB_FORGET && result == ESP_OK) {
         settings_draft()->wifi_enabled = false;
         settings_switch_set(s_set_wifi_switch, false);
+        ui_app_set_wifi_enabled(false);
     }
 
     if (s_wifi_job_toast[0]) {
@@ -2299,6 +2304,20 @@ static void wifi_async_apply_enabled(bool enabled)
         .enable = enabled,
     };
     (void)wifi_async_start(&job, WIFI_UI_APPLYING, enabled ? "Starting Wi-Fi..." : "Stopping Wi-Fi...");
+}
+
+void ui_wifi_autostart(const spod_app_state_t *state)
+{
+    char ssid[AUDIO_BACKEND_WIFI_SSID_MAX] = "";
+    bool has_saved = false;
+    if (!state || !state->wifi_enabled) {
+        return;
+    }
+    if (audio_backend_wifi_get_saved_network(ssid, sizeof(ssid), &has_saved) != ESP_OK || !has_saved || ssid[0] == '\0') {
+        return;
+    }
+    ESP_LOGI(TAG, "Wi-Fi autostart: connecting to saved network \"%s\"", ssid);
+    wifi_async_apply_enabled(true);
 }
 
 static void settings_label_percent(lv_obj_t *lbl, uint8_t v)
