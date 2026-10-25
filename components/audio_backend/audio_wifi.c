@@ -1329,7 +1329,9 @@ static esp_err_t wifi_connect_sta_for_scan(void)
     wifi_config_t wifi_cfg = {0};
     strlcpy((char *)wifi_cfg.sta.ssid, s_wifi_ssid, sizeof(wifi_cfg.sta.ssid));
     strlcpy((char *)wifi_cfg.sta.password, s_wifi_password, sizeof(wifi_cfg.sta.password));
-    wifi_cfg.sta.scan_method = WIFI_FAST_SCAN;
+    /* Mesh/multi-AP networks share one SSID: scan all channels and join the strongest node. */
+    wifi_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     wifi_cfg.sta.failure_retry_cnt = WIFI_MAX_RETRY;
     wifi_cfg.sta.threshold.authmode = (s_wifi_password[0] == '\0')
                                     ? WIFI_AUTH_OPEN
@@ -1643,7 +1645,9 @@ esp_err_t audio_backend_wifi_upload_start(void)
     strlcpy((char *)wifi_cfg.sta.password,
             s_wifi_password,
             sizeof(wifi_cfg.sta.password));
-    wifi_cfg.sta.scan_method = WIFI_FAST_SCAN;
+    /* Mesh/multi-AP networks share one SSID: scan all channels and join the strongest node. */
+    wifi_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     wifi_cfg.sta.failure_retry_cnt = WIFI_MAX_RETRY;
     wifi_cfg.sta.threshold.authmode = (s_wifi_password[0] == '\0')
                                     ? WIFI_AUTH_OPEN
@@ -1845,6 +1849,13 @@ esp_err_t audio_backend_wifi_connect_network(const char *ssid, const char *passw
             return err;
         }
         s_wifi_has_saved_credentials = true;
+    }
+
+    /* Being on the network without the portal looked like a dead device; serve it right away. */
+    if (s_wifi_connected && wifi_upload_start_http_server() == ESP_OK) {
+        wifi_status_set("Upload: http://%s", s_wifi_ip);
+        ESP_LOGI(TAG, "%s (connected to %s)", s_wifi_status, s_wifi_ssid);
+        return ESP_OK;
     }
 
     wifi_status_set("Wi-Fi: connected to %s", s_wifi_ssid);

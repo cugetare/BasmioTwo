@@ -53,7 +53,9 @@ static const char *TAG = "bsp";
 
 #define BSP_LCD_HOST            SPI2_HOST
 #define BSP_LCD_PIXEL_CLOCK_HZ  (50 * 1000 * 1000)
-#define BSP_LVGL_BUF_LINES      16
+#define BSP_LVGL_BUF_LINES      32
+#define BSP_PUSH_LINES          16
+#define BSP_PUSH_BUF_COUNT      2
 
 #define BSP_BL_LEDC_TIMER       LEDC_TIMER_0
 #define BSP_BL_LEDC_CHANNEL     LEDC_CHANNEL_0
@@ -67,10 +69,11 @@ static esp_lcd_touch_handle_t s_touch = NULL;
 static lv_disp_draw_buf_t s_draw_buf;
 static lv_disp_drv_t s_disp_drv;
 static lv_indev_drv_t s_indev_drv;
-static void *s_flush_dma_buf = NULL;
-static size_t s_flush_dma_bytes = 0;
+static void *s_push_bufs[BSP_PUSH_BUF_COUNT];
 static uint16_t *s_lcd_framebuffer = NULL;
 static SemaphoreHandle_t s_flush_done_sem = NULL;
+/* Highest physical row touched since the last push, -1 when nothing is dirty. */
+static int s_dirty_row_max = -1;
 
 static const axs15231b_lcd_init_cmd_t s_lcd_init_cmds[] = {
     {0xBB, (uint8_t []){0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5A, 0xA5}, 8, 0},
@@ -107,12 +110,18 @@ static const axs15231b_lcd_init_cmd_t s_lcd_init_cmds[] = {
     {0x29, (uint8_t []){0x00}, 0, 20},
 };
 
-static void draw_native_fill(uint16_t color)
+static void flush_sem_ensure(void)
 {
     if (!s_flush_done_sem) {
-        s_flush_done_sem = xSemaphoreCreateBinary();
+        /* Counting: up to BSP_PUSH_BUF_COUNT colour transfers can complete before we take. */
+        s_flush_done_sem = xSemaphoreCreateCounting(BSP_PUSH_BUF_COUNT, 0);
     }
     assert(s_flush_done_sem);
+}
+
+static void draw_native_fill(uint16_t color)
+{
+    flush_sem_ensure();
 
     const int lines = 16;
     const size_t pixels = (size_t)BSP_LCD_PHYS_H_RES * lines;
@@ -138,39 +147,33 @@ static void draw_native_fill(uint16_t color)
     free(buf);
 }
 
-static uint16_t lv_color_to_panel_word(const lv_color_t *color)
+/*
+ * Streams physical rows [0, row_end) to the panel. In QSPI mode the AXS15231B
+ * driver sends no RASET: a write at row 0 uses RAMWR, every other write uses
+ * RAMWRC and continues where the previous one stopped. So a push must always
+ * start at row 0, but it can stop right after the last dirty row.
+ * Two bounce buffers let the PSRAM->DMA copy overlap the previous transfer.
+ */
+static void push_native_rows(int row_end)
 {
-    lv_color32_t c32 = {.full = lv_color_to32(*color)};
-    uint16_t r = (uint16_t)(c32.ch.red >> 3);
-    uint16_t g = (uint16_t)(c32.ch.green >> 2);
-    uint16_t b = (uint16_t)(c32.ch.blue >> 3);
-    return (r << 11) | (g << 5) | b;
-}
+    assert(s_push_bufs[0] && s_push_bufs[1] && s_flush_done_sem && s_lcd_framebuffer);
 
-static void fb_put_panel_word(int px, int py, uint16_t word)
-{
-    uint8_t *dst = (uint8_t *)&s_lcd_framebuffer[(size_t)py * BSP_LCD_PHYS_H_RES + px];
-    dst[0] = (uint8_t)(word >> 8);
-    dst[1] = (uint8_t)word;
-}
-
-static void push_native_framebuffer(void)
-{
-    assert(s_flush_dma_buf && s_flush_done_sem && s_lcd_framebuffer);
-
-    const int lines = BSP_LVGL_BUF_LINES;
     const size_t line_bytes = (size_t)BSP_LCD_PHYS_H_RES * sizeof(uint16_t);
-    for (int y = 0; y < BSP_LCD_PHYS_V_RES; y += lines) {
-        const int h = (BSP_LCD_PHYS_V_RES - y) > lines ? lines : (BSP_LCD_PHYS_V_RES - y);
-        memcpy(s_flush_dma_buf,
-               &s_lcd_framebuffer[(size_t)y * BSP_LCD_PHYS_H_RES],
-               (size_t)h * line_bytes);
-        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(s_panel,
-                                                  0,
-                                                  y,
-                                                  BSP_LCD_PHYS_H_RES,
-                                                  y + h,
-                                                  s_flush_dma_buf));
+    int inflight = 0;
+    int k = 0;
+    for (int y = 0; y < row_end; y += BSP_PUSH_LINES) {
+        const int h = (row_end - y) > BSP_PUSH_LINES ? BSP_PUSH_LINES : (row_end - y);
+        if (inflight == BSP_PUSH_BUF_COUNT) {
+            /* Transfers finish in order, so this frees the buffer we are about to reuse. */
+            xSemaphoreTake(s_flush_done_sem, portMAX_DELAY);
+            inflight--;
+        }
+        memcpy(s_push_bufs[k], &s_lcd_framebuffer[(size_t)y * BSP_LCD_PHYS_H_RES], (size_t)h * line_bytes);
+        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(s_panel, 0, y, BSP_LCD_PHYS_H_RES, y + h, s_push_bufs[k]));
+        inflight++;
+        k = (k + 1) % BSP_PUSH_BUF_COUNT;
+    }
+    while (inflight-- > 0) {
         xSemaphoreTake(s_flush_done_sem, portMAX_DELAY);
     }
 }
@@ -178,10 +181,7 @@ static void push_native_framebuffer(void)
 #if BSP_DISPLAY_PATTERN_ONLY
 static void draw_native_test_pattern(void)
 {
-    if (!s_flush_done_sem) {
-        s_flush_done_sem = xSemaphoreCreateBinary();
-    }
-    assert(s_flush_done_sem);
+    flush_sem_ensure();
 
     const int lines = 16;
     const size_t pixels = (size_t)BSP_LCD_PHYS_H_RES * lines;
@@ -247,7 +247,7 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
     int y_start = area->y1;
     int y_end = area->y2;
 
-    if (!s_lcd_framebuffer || !s_flush_dma_buf || !s_flush_done_sem) {
+    if (!s_lcd_framebuffer || !s_push_bufs[0] || !s_flush_done_sem) {
         ESP_LOGW(TAG, "flush framebuffer unavailable");
         lv_disp_flush_ready(drv);
         return;
@@ -258,26 +258,32 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
     if (x_end >= BSP_LCD_H_RES) x_end = BSP_LCD_H_RES - 1;
     if (y_end >= BSP_LCD_V_RES) y_end = BSP_LCD_V_RES - 1;
     if (x_start > x_end || y_start > y_end) {
-        lv_disp_flush_ready(drv);
-        return;
+        /* Nothing visible here, but earlier areas of this refresh may still need pushing. */
+        x_end = -1;
     }
 
+    /*
+     * Logical (lx, ly) maps to physical (px = PHYS_H - 1 - ly, py = lx). Walk one
+     * logical column at a time so the PSRAM writes run along a physical row
+     * (contiguous, descending px) instead of striding 640 bytes per pixel.
+     * Panel expects big-endian RGB565; lv_color_t holds native RGB565.
+     */
     const int width = area->x2 - area->x1 + 1;
-    for (int ly = y_start; ly <= y_end; ly++) {
-        for (int lx = x_start; lx <= x_end; lx++) {
-            const int px = BSP_LCD_PHYS_H_RES - ly - 1;
-            const int py = lx;
-            if ((unsigned)px < BSP_LCD_PHYS_H_RES && (unsigned)py < BSP_LCD_PHYS_V_RES) {
-                fb_put_panel_word(px,
-                                  py,
-                                  lv_color_to_panel_word(&color_map[(size_t)(ly - area->y1) * width +
-                                                                    (size_t)(lx - area->x1)]));
-            }
+    for (int lx = x_start; lx <= x_end; lx++) {
+        uint16_t *dst = &s_lcd_framebuffer[(size_t)lx * BSP_LCD_PHYS_H_RES + (BSP_LCD_PHYS_H_RES - 1 - y_start)];
+        const lv_color_t *src = &color_map[(size_t)(y_start - area->y1) * width + (size_t)(lx - area->x1)];
+        for (int ly = y_start; ly <= y_end; ly++) {
+            *dst-- = __builtin_bswap16(src->full);
+            src += width;
         }
     }
+    if (x_end > s_dirty_row_max) {
+        s_dirty_row_max = x_end;
+    }
 
-    if (lv_disp_flush_is_last(drv)) {
-        push_native_framebuffer();
+    if (lv_disp_flush_is_last(drv) && s_dirty_row_max >= 0) {
+        push_native_rows(s_dirty_row_max + 1);
+        s_dirty_row_max = -1;
     }
 
     lv_disp_flush_ready(drv);
@@ -394,10 +400,7 @@ void bsp_display_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, false));
     ESP_LOGI(TAG, "AXS15231B panel ready (%dx%d physical, %dx%d logical)",
              BSP_LCD_PHYS_H_RES, BSP_LCD_PHYS_V_RES, BSP_LCD_H_RES, BSP_LCD_V_RES);
-    if (!s_flush_done_sem) {
-        s_flush_done_sem = xSemaphoreCreateBinary();
-    }
-    assert(s_flush_done_sem);
+    flush_sem_ensure();
 
 #if BSP_DISPLAY_PATTERN_ONLY
     bsp_backlight_set(100);
@@ -444,35 +447,32 @@ void bsp_display_init(void)
     lv_init();
     size_t buf_px = (size_t)BSP_LCD_H_RES * BSP_LVGL_BUF_LINES;
     size_t buf_bytes = buf_px * sizeof(lv_color_t);
-    s_flush_dma_bytes = (size_t)BSP_LCD_PHYS_H_RES * BSP_LVGL_BUF_LINES * sizeof(lv_color_t);
-    s_flush_dma_buf = heap_caps_malloc(s_flush_dma_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    const size_t push_bytes = (size_t)BSP_LCD_PHYS_H_RES * BSP_PUSH_LINES * sizeof(uint16_t);
+    for (int i = 0; i < BSP_PUSH_BUF_COUNT; i++) {
+        s_push_bufs[i] = heap_caps_malloc(push_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    }
     s_lcd_framebuffer = heap_caps_calloc((size_t)BSP_LCD_PHYS_H_RES * BSP_LCD_PHYS_V_RES,
                                          sizeof(uint16_t),
                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_flush_done_sem) {
-        s_flush_done_sem = xSemaphoreCreateBinary();
-    }
-    ESP_LOGI(TAG, "LVGL DMA bounce buffer: buf=%p bytes=%u fb=%p",
-             s_flush_dma_buf, (unsigned)s_flush_dma_bytes, s_lcd_framebuffer);
-    assert(s_flush_dma_buf && s_lcd_framebuffer && s_flush_done_sem);
+    ESP_LOGI(TAG, "LCD push buffers: %p %p bytes=%u fb=%p",
+             s_push_bufs[0], s_push_bufs[1], (unsigned)push_bytes, s_lcd_framebuffer);
+    assert(s_push_bufs[0] && s_push_bufs[1] && s_lcd_framebuffer && s_flush_done_sem);
 
-    lv_color_t *buf1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    lv_color_t *buf2 = heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    if (!buf1 || !buf2) {
-        ESP_LOGW(TAG, "Internal DMA LVGL buffer allocation failed; trying PSRAM fallback");
+    /* Flush rotates into the framebuffer synchronously, so a second LVGL buffer would sit idle. */
+    lv_color_t *buf1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!buf1) {
+        ESP_LOGW(TAG, "Internal LVGL buffer allocation failed; trying PSRAM fallback");
         buf1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        buf2 = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
-    ESP_LOGI(TAG, "LVGL buffers: buf1=%p buf2=%p bytes=%u", buf1, buf2, (unsigned)buf_bytes);
-    assert(buf1 && buf2);
-    lv_disp_draw_buf_init(&s_draw_buf, buf1, buf2, (lv_coord_t)buf_px);
+    ESP_LOGI(TAG, "LVGL buffer: %p bytes=%u", buf1, (unsigned)buf_bytes);
+    assert(buf1);
+    lv_disp_draw_buf_init(&s_draw_buf, buf1, NULL, (lv_coord_t)buf_px);
 
     lv_disp_drv_init(&s_disp_drv);
     s_disp_drv.hor_res = BSP_LCD_H_RES;
     s_disp_drv.ver_res = BSP_LCD_V_RES;
     s_disp_drv.flush_cb = lvgl_flush_cb;
     s_disp_drv.draw_buf = &s_draw_buf;
-    s_disp_drv.full_refresh = 1;
     s_disp_drv.antialiasing = 1;
     s_disp_drv.user_data = s_panel;
     lv_disp_t *disp = lv_disp_drv_register(&s_disp_drv);
