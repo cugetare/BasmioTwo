@@ -598,6 +598,8 @@ typedef struct {
 } wifi_link_check_t;
 
 static wifi_link_check_t s_link_check;
+#define WIFI_LINK_HEAL_MAX 2
+static uint8_t s_link_heal_count;
 
 static void link_check_on_success(esp_ping_handle_t hdl, void *args)
 {
@@ -634,6 +636,19 @@ static void link_check_on_end(esp_ping_handle_t hdl, void *args)
              have_ap ? ap.bssid[3] : 0, have_ap ? ap.bssid[4] : 0, have_ap ? ap.bssid[5] : 0,
              have_ap ? ap.rssi : 0);
     esp_ping_delete_session(hdl);
+
+    /*
+     * After an unclean power-off the mesh can keep routing to the old
+     * association: connected, but most packets lost. Reconnecting clears it
+     * (the disconnect handler reconnects and the next GOT_IP re-checks).
+     */
+    if (total > 0 && s_link_check.lost * 2u >= total && s_link_heal_count < WIFI_LINK_HEAL_MAX) {
+        s_link_heal_count++;
+        ESP_LOGW(TAG, "Link check failed; reconnecting (%u/%u)", (unsigned)s_link_heal_count, (unsigned)WIFI_LINK_HEAL_MAX);
+        (void)esp_wifi_disconnect();
+    } else if (s_link_check.lost * 2u < total) {
+        s_link_heal_count = 0;
+    }
 }
 
 static void wifi_link_check_start(const esp_ip4_addr_t *gw)
