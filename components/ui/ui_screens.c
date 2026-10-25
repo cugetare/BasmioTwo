@@ -913,8 +913,11 @@ static void cb_detail_play(lv_event_t *e)
     if (st->playback_state == PLAYBACK_STOPPED) {
         st->current_chapter = 0;
         st->elapsed_sec     = 0;
+        ui_app_select_chapter(0);
+    } else if (st->playback_state == PLAYBACK_PAUSED) {
+        /* "Continue" picks up where it paused instead of restarting the chapter. */
+        ui_app_toggle_playback();
     }
-    ui_app_select_chapter(st->current_chapter);
     st->chapters_open  = false;
     ui_app_navigate_to(SCREEN_NOW_PLAYING, false);
 }
@@ -1339,7 +1342,7 @@ static void cb_np_back(lv_event_t *e)
         ui_chapters_sheet_set_visible(false, st);
         return;
     }
-    ui_app_stop_playback();
+    /* Background play: leaving Now Playing keeps the story playing. */
     ui_app_navigate_to(SCREEN_LIBRARY, true);   /* BUG-20 FIX */
 }
 

@@ -99,10 +99,22 @@ void ui_app_navigate_to(spod_screen_id_t target, bool go_back);
 spod_app_state_t *ui_app_get_state(void);
 
 /**
- * @brief Select a story by dataset index and reset playback position.
+ * @brief Select a story by dataset index for browsing.
+ *
+ * Playback of another story keeps running in the background; selecting the
+ * story that is playing restores its chapter and position.
  * @param story_index  Index into active dataset [0, ui_app_story_count()).
  */
 void ui_app_select_story(uint8_t story_index);
+
+/** @brief True while a story is playing or paused, in the foreground or background. */
+bool ui_app_is_playback_active(void);
+
+/**
+ * @brief Bring the playing story back to the Now Playing screen.
+ * @return false when nothing is playing or paused.
+ */
+bool ui_app_return_to_now_playing(void);
 
 /**
  * @brief Return active story count (runtime SD catalog or mock fallback).

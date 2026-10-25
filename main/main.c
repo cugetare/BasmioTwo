@@ -43,6 +43,9 @@ typedef enum {
 
 static ui_idle_state_t s_idle_state = UI_ACTIVE;
 static uint32_t s_last_activity = 0;
+/* After this much inactivity with a story playing, show Now Playing again (once per idle period). */
+#define IDLE_RETURN_TO_NP_MS    (30u * 1000u)
+static bool s_np_returned = false;
 static volatile bool s_boot_tone_done = false;
 static volatile esp_err_t s_boot_tone_ret = ESP_FAIL;
 static const char *TAG = "app_main";
@@ -310,6 +313,7 @@ static void run_boot_sequence(void)
 void ui_wakeup(void)
 {
     s_last_activity = lv_tick_get();
+    s_np_returned = false;
 
     if (s_idle_state != UI_ACTIVE) {
         ui_set_backlight_target(s_user_brightness);
@@ -388,13 +392,18 @@ static void idle_check_cb(lv_timer_t *t)
 {
     uint32_t now  = lv_tick_get();
     uint32_t idle = now - s_last_activity;
-    const spod_app_state_t *state = ui_app_get_state();
-    const bool is_playing = (state && state->playback_state == PLAYBACK_PLAYING);
+    /* Covers background playback too, where the visible screen may show a stopped story. */
+    const bool is_active = ui_app_is_playback_active();
 
-    if (!is_playing && idle > s_idle_off_ms) {
+    if (!is_active && idle > s_idle_off_ms) {
         ui_toast_show("Idle power off");
         ui_app_request_shutdown();
         return;
+    }
+
+    if (is_active && !s_np_returned && idle > IDLE_RETURN_TO_NP_MS) {
+        s_np_returned = true;
+        (void)ui_app_return_to_now_playing();
     }
 
     switch (s_idle_state) {

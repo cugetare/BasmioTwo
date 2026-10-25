@@ -665,6 +665,62 @@ const spod_story_t *ui_app_story_get(uint8_t story_index)
         : &g_mock_stories[story_index];
 }
 
+/*
+ * Background playback: browsing another story must not stop what is playing.
+ * The playing story's context is parked here while s_state shows the browsed
+ * story, and restored when the user (or the idle timer) returns to it.
+ */
+typedef struct {
+    const spod_story_t   *story;     /* NULL: nothing parked */
+    uint8_t               chapter;
+    uint16_t              elapsed_sec;
+    uint16_t              duration_sec;
+    spod_playback_state_t playback_state;
+} bg_playback_t;
+
+static bg_playback_t s_bg;
+
+static void bg_park_current(void)
+{
+    s_bg.story = s_state.selected_story;
+    s_bg.chapter = s_state.current_chapter;
+    s_bg.elapsed_sec = s_state.elapsed_sec;
+    s_bg.duration_sec = s_state.chapter_duration_sec;
+    s_bg.playback_state = s_state.playback_state;
+}
+
+static void bg_restore(void)
+{
+    s_state.selected_story = s_bg.story;
+    s_state.current_chapter = s_bg.chapter;
+    s_state.elapsed_sec = s_bg.elapsed_sec;
+    s_state.chapter_duration_sec = s_bg.duration_sec;
+    s_state.playback_state = s_bg.playback_state;
+    s_state.chapters_open = false;
+    s_bg.story = NULL;
+}
+
+bool ui_app_is_playback_active(void)
+{
+    return s_bg.story != NULL ||
+           (s_state.selected_story && s_state.playback_state != PLAYBACK_STOPPED);
+}
+
+bool ui_app_return_to_now_playing(void)
+{
+    if (s_bg.story) {
+        bg_restore();
+    }
+    if (!s_state.selected_story || s_state.playback_state == PLAYBACK_STOPPED) {
+        return false;
+    }
+    if (s_state.current_screen != SCREEN_NOW_PLAYING) {
+        s_state.chapters_open = false;
+        ui_app_navigate_to(SCREEN_NOW_PLAYING, false);
+    }
+    return true;
+}
+
 void ui_app_select_story(uint8_t story_index)
 {
     const spod_story_t *story = ui_app_story_get(story_index);
@@ -672,7 +728,18 @@ void ui_app_select_story(uint8_t story_index)
         return;
     }
 
-    (void)audio_backend_stop();
+    if (s_bg.story == story) {
+        /* Back to the story that is playing in the background. */
+        bg_restore();
+        return;
+    }
+    if (s_state.selected_story == story && s_state.playback_state != PLAYBACK_STOPPED) {
+        s_state.chapters_open = false;
+        return;
+    }
+    if (s_state.selected_story && s_state.playback_state != PLAYBACK_STOPPED) {
+        bg_park_current();
+    }
 
     s_state.selected_story  = story;
     s_state.current_chapter = 0;
@@ -708,6 +775,7 @@ void ui_app_toggle_playback(void)
             err = audio_backend_resume();
         } else {
             err = audio_backend_play_chapter(s_state.selected_story->id, s_state.current_chapter);
+            s_bg.story = NULL; /* the backend replaced the parked playback */
         }
 
         if (err == ESP_OK) {
@@ -741,6 +809,7 @@ void ui_app_select_chapter(uint8_t chapter_index)
     s_state.elapsed_sec     = 0;
     s_state.chapter_duration_sec = s_state.selected_story->chapters[chapter_index].duration_sec;
     esp_err_t err = audio_backend_play_chapter(s_state.selected_story->id, chapter_index);
+    s_bg.story = NULL;
     if (err == ESP_OK) {
         s_state.playback_state = PLAYBACK_PLAYING;
     } else {
@@ -814,6 +883,7 @@ void ui_app_resume_selected_story(void)
     s_state.chapter_duration_sec = s_state.selected_story->chapters[resume_chapter].duration_sec;
 
     esp_err_t err = audio_backend_play_chapter_from(s_state.selected_story->id, resume_chapter, resume_sec);
+    s_bg.story = NULL;
     if (err == ESP_OK) {
         s_state.playback_state = PLAYBACK_PLAYING;
     } else {
@@ -1000,6 +1070,7 @@ void ui_app_stop_playback(void)
         ESP_LOGW(TAG, "Stop playback failed (%s)", esp_err_to_name(err));
         audio_error_toast(err);
     }
+    s_bg.story = NULL;
     s_state.playback_state = PLAYBACK_STOPPED;
     s_state.elapsed_sec = 0;
     if (s_state.selected_story && s_state.current_chapter < s_state.selected_story->chapter_count) {
@@ -1030,9 +1101,39 @@ void ui_app_cycle_sleep_timer(void)
     ui_screen_now_playing_refresh(&s_state);
 }
 
+/* Keeps parked background playback moving: progress and auto-advance to the next chapter. */
+static void bg_poll_playback_progress(void)
+{
+    if (audio_backend_consume_finished_event()) {
+        const uint8_t next = (uint8_t)(s_bg.chapter + 1u);
+        if (next < s_bg.story->chapter_count &&
+            audio_backend_play_chapter(s_bg.story->id, next) == ESP_OK) {
+            s_bg.chapter = next;
+            s_bg.elapsed_sec = 0;
+            s_bg.duration_sec = s_bg.story->chapters[next].duration_sec;
+        } else {
+            s_bg.story = NULL;
+        }
+        return;
+    }
+
+    uint32_t elapsed_sec = 0;
+    uint32_t duration_sec = 0;
+    if (audio_backend_get_playback_progress(&elapsed_sec, &duration_sec) == ESP_OK) {
+        s_bg.elapsed_sec = (uint16_t)(elapsed_sec > UINT16_MAX ? UINT16_MAX : elapsed_sec);
+        if (duration_sec > 0u) {
+            s_bg.duration_sec = (uint16_t)(duration_sec > UINT16_MAX ? UINT16_MAX : duration_sec);
+        }
+    }
+}
+
 void ui_app_poll_playback_progress(void)
 {
     if (s_shutdown_in_progress) {
+        return;
+    }
+    if (s_bg.story) {
+        bg_poll_playback_progress();
         return;
     }
     if (!s_state.selected_story || s_state.playback_state == PLAYBACK_STOPPED) {

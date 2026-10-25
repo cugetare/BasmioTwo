@@ -72,6 +72,8 @@ static const char *TAG = "audio_backend";
 #define MP3_OUTPUT_BUFFER_SIZE      (8 * 1024)
 #define MP3_PAUSE_POLL_MS           20
 #define MP3_WRITE_TIMEOUT_MS        500
+#define MP3_RESUME_BACKOFF_SEC      3
+#define MP3_PERSIST_PERIOD_SEC      30
 #define ID3V2_MAX_TAG_BYTES         (2 * 1024 * 1024)
 #define ID3V2_MAX_APIC_BYTES        (1024 * 1024)
 #define ID3V2_COVER_BASENAME        "ID3COVR"
@@ -2257,6 +2259,36 @@ static void mp3_playback_task(void *arg)
 
     uint64_t remaining_skip_us = (uint64_t)playback_start_offset_sec() * 1000000ULL;
 
+    /*
+     * Resume: decoding and discarding everything up to the offset took tens
+     * of seconds for long chapters and looked like resume did nothing. Seek
+     * by average byte rate instead, a few seconds early; the decoder resyncs
+     * on the next frame header. Falls back to decode-skip without a duration.
+     */
+    if (remaining_skip_us > 0) {
+        uint32_t duration_sec = 0;
+        playback_get_position(NULL, &duration_sec);
+        const uint32_t start_sec = playback_start_offset_sec();
+        long file_end = -1;
+        if (fseek(fp, 0, SEEK_END) == 0) {
+            file_end = ftell(fp);
+        }
+        if (duration_sec > 0 && file_end > (long)id3_skip && start_sec < duration_sec) {
+            const uint32_t target_sec = (start_sec > MP3_RESUME_BACKOFF_SEC) ? (start_sec - MP3_RESUME_BACKOFF_SEC) : 0;
+            const uint64_t audio_bytes = (uint64_t)(file_end - (long)id3_skip);
+            const long target_pos = (long)id3_skip + (long)((audio_bytes * target_sec) / duration_sec);
+            if (fseek(fp, target_pos, SEEK_SET) == 0) {
+                playback_set_position((uint64_t)target_sec * 1000000ULL, duration_sec, target_sec);
+                remaining_skip_us = 0;
+                ESP_LOGI(TAG, "Resume seek: %us -> byte %ld (%us)", (unsigned)start_sec, target_pos, (unsigned)target_sec);
+            }
+        }
+        if (remaining_skip_us > 0) {
+            (void)fseek(fp, (long)id3_skip, SEEK_SET);
+        }
+    }
+    uint32_t last_persist_sec = playback_elapsed_sec();
+
     while (!playback_stop_requested()) {
         if (playback_pause_requested()) {
             uint8_t vu = playback_get_vu_level();
@@ -2384,6 +2416,14 @@ static void mp3_playback_task(void *arg)
                 }
 
                 playback_add_elapsed(frame_us);
+                {
+                    /* Save the position periodically so power-off or a crash mid-chapter can still resume. */
+                    const uint32_t now_sec = playback_elapsed_sec();
+                    if (now_sec >= last_persist_sec + MP3_PERSIST_PERIOD_SEC) {
+                        last_persist_sec = now_sec;
+                        persist_active_story_progress(false);
+                    }
+                }
 
                 if (sample_rate != s_i2s_sample_rate_hz) {
                     (void)reconfigure_i2s_clock(sample_rate);
