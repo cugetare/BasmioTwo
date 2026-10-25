@@ -4,4 +4,6 @@ cmake_minimum_required(VERSION 3.22)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 file(READ "${CMAKE_CURRENT_LIST_DIR}/VERSION" PROJECT_VER)
 string(STRIP "${PROJECT_VER}" PROJECT_VER)
+# Re-run configure when VERSION changes, otherwise the old version stays baked into the image.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/VERSION")
 project(BasmioTwo)
